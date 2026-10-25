@@ -22,7 +22,7 @@ streamlit run app.py
 ```
 
 ## Live Demo
-Add your Streamlit deployment URL here after deployment.
+https://customer-behaviour-analytics-and-customer-lifetime-value-predi.streamlit.app/
 
 ## Note
 The model predicts spending over a defined future period, not a customer's entire lifetime value. Prediction accuracy is limited, so results should be interpreted cautiously.
