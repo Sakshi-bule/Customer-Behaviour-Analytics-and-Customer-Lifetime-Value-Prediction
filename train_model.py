@@ -1,271 +1,309 @@
-
 import os
+import time
+import warnings
 import joblib
 import numpy as np
 import pandas as pd
 
-from sklearn.compose import TransformedTargetRegressor
+from sklearn.cluster import KMeans
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.impute import SimpleImputer
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
-from sklearn.cluster import KMeans
+from sklearn.compose import TransformedTargetRegressor
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
-# -----------------------------------
-# 1. Load and prepare transaction data
-# -----------------------------------
+warnings.filterwarnings("ignore")
+start = time.time()
 
-print("Loading cleaned retail data...")
-
-if not os.path.exists("cleaned_retail_data.csv"):
+# --------------------------------------------------
+# 1. LOAD TRANSACTION DATA
+# --------------------------------------------------
+if os.path.exists("cleaned_retail_data.csv"):
+    df = pd.read_csv("cleaned_retail_data.csv")
+    print("Loaded cleaned_retail_data.csv")
+elif os.path.exists("Online Retail.xlsx"):
+    df = pd.read_excel("Online Retail.xlsx")
+    print("Loaded Online Retail.xlsx")
+else:
     raise FileNotFoundError(
-        "cleaned_retail_data.csv not found. "
-        "Run prepare_data.py first."
+        "Put cleaned_retail_data.csv or Online Retail.xlsx "
+        "in the same folder as train_model.py."
     )
 
-df = pd.read_csv("cleaned_retail_data.csv")
+# Normalize column names
+df.columns = [str(c).strip() for c in df.columns]
 
-required_columns = [
-    "InvoiceNo", "InvoiceDate", "CustomerID",
-    "Quantity", "UnitPrice", "Revenue"
+required = [
+    "InvoiceDate", "CustomerID", "Quantity", "UnitPrice"
 ]
+missing = [c for c in required if c not in df.columns]
 
-missing = [col for col in required_columns if col not in df.columns]
 if missing:
-    raise ValueError(f"Missing columns in dataset: {missing}")
+    raise ValueError(
+        f"Missing columns: {missing}. Available: {list(df.columns)}"
+    )
 
+# --------------------------------------------------
+# 2. CLEAN DATA
+# --------------------------------------------------
 df["InvoiceDate"] = pd.to_datetime(df["InvoiceDate"], errors="coerce")
-df["CustomerID"] = df["CustomerID"].astype(str).str.replace(
-    r"\.0$", "", regex=True
-)
-df["Revenue"] = pd.to_numeric(df["Revenue"], errors="coerce")
+df["CustomerID"] = pd.to_numeric(df["CustomerID"], errors="coerce")
+df["Quantity"] = pd.to_numeric(df["Quantity"], errors="coerce")
+df["UnitPrice"] = pd.to_numeric(df["UnitPrice"], errors="coerce")
 
 df = df.dropna(
-    subset=["InvoiceNo", "InvoiceDate", "CustomerID", "Revenue"]
+    subset=["InvoiceDate", "CustomerID", "Quantity", "UnitPrice"]
 )
 df = df[
-    (df["Revenue"] > 0)
-    & (df["Quantity"] > 0)
-    & (df["UnitPrice"] > 0)
+    (df["Quantity"] > 0) &
+    (df["UnitPrice"] > 0)
 ].copy()
 
+if "InvoiceNo" in df.columns:
+    df = df[
+        ~df["InvoiceNo"].astype(str).str.startswith("C")
+    ].copy()
+
+df["Revenue"] = df["Quantity"] * df["UnitPrice"]
+df = df.sort_values("InvoiceDate")
+
 if df.empty:
-    raise ValueError("No valid transactions remain after cleaning.")
+    raise ValueError("No valid transaction rows remain after cleaning.")
 
-df["InvoiceDateOnly"] = df["InvoiceDate"].dt.normalize()
+print("Clean transaction rows:", len(df))
+print("Unique customers:", df["CustomerID"].nunique())
 
-# -----------------------------------
-# 2. Split transactions by date
-# -----------------------------------
+# --------------------------------------------------
+# 3. DEFINE HISTORY AND FUTURE PERIODS
+# Use the first 80% of the observed time span for history.
+# The remaining 20% is the future prediction period.
+# --------------------------------------------------
+min_date = df["InvoiceDate"].min().normalize()
+max_date = df["InvoiceDate"].max().normalize()
+total_days = (max_date - min_date).days
 
-dates = np.sort(df["InvoiceDateOnly"].unique())
+if total_days < 10:
+    raise ValueError(
+        "Not enough date coverage to create a future-spending target."
+    )
 
-if len(dates) < 2:
-    raise ValueError("At least two distinct transaction dates are required.")
+cutoff = min_date + pd.Timedelta(days=int(total_days * 0.8))
+future_end = max_date + pd.Timedelta(days=1)
 
-split_index = int(len(dates) * 0.8)
-split_index = min(max(split_index, 1), len(dates) - 1)
-cutoff = pd.Timestamp(dates[split_index])
+history = df[df["InvoiceDate"] < cutoff].copy()
+future = df[
+    (df["InvoiceDate"] >= cutoff) &
+    (df["InvoiceDate"] < future_end)
+].copy()
 
-history = df[df["InvoiceDateOnly"] < cutoff].copy()
-future = df[df["InvoiceDateOnly"] >= cutoff].copy()
+if history.empty or future.empty:
+    raise ValueError(
+        "History or future period is empty. Check transaction dates."
+    )
 
-if history.empty:
-    raise ValueError("Historical transactions are empty.")
+print("History cutoff:", cutoff.date())
+print("Future period ends:", max_date.date())
 
-print("Historical cutoff:", cutoff.date())
-print("Historical transactions:", len(history))
-print("Future transactions:", len(future))
+# --------------------------------------------------
+# 4. BUILD CUSTOMER FEATURES FROM HISTORY ONLY
+# --------------------------------------------------
+reference_date = cutoff
 
-# -----------------------------------
-# 3. Create customer features
-# -----------------------------------
-
-reference_date = history["InvoiceDate"].max() + pd.Timedelta(days=1)
+history["InvoiceNo"] = (
+    history["InvoiceNo"].astype(str)
+    if "InvoiceNo" in history.columns
+    else history.index.astype(str)
+)
 
 features = history.groupby("CustomerID").agg(
     Total_Spending=("Revenue", "sum"),
     Purchase_Frequency=("InvoiceNo", "nunique"),
     Total_Quantity=("Quantity", "sum"),
     Average_Order_Value=("Revenue", "mean"),
+    First_Purchase=("InvoiceDate", "min"),
     Last_Purchase=("InvoiceDate", "max")
+).reset_index()
+
+features["Days_Since_Last_Purchase"] = (
+    reference_date - features["Last_Purchase"]
+).dt.days.clip(lower=0)
+
+features["Customer_Tenure_Days"] = (
+    features["Last_Purchase"] - features["First_Purchase"]
+).dt.days.clip(lower=0)
+
+# Store readable customer feature table
+features.to_csv("customer_features.csv", index=False)
+
+# --------------------------------------------------
+# 5. CREATE THE FUTURE-SPENDING TARGET
+# --------------------------------------------------
+target = future.groupby("CustomerID")["Revenue"].sum()
+target.name = "FutureSpending"
+
+data = features.merge(
+    target,
+    on="CustomerID",
+    how="left"
 )
 
-features["Recency_Days"] = (
-    reference_date - features["Last_Purchase"]
-).dt.days
+# Customers with no purchases in the future period get zero spending
+data["FutureSpending"] = data["FutureSpending"].fillna(0)
 
-features = features.drop(columns=["Last_Purchase"])
+# Save results used by the dashboard
+data.to_csv("customer_ml_results.csv", index=False)
 
-# Future spending is the prediction target.
-future_spending = future.groupby("CustomerID")["Revenue"].sum()
-future_spending.name = "Future_Spending"
-
-dataset = features.join(future_spending, how="left")
-dataset["Future_Spending"] = dataset["Future_Spending"].fillna(0)
-
-FEATURES = [
+# --------------------------------------------------
+# 6. PREPARE MODEL INPUTS
+# --------------------------------------------------
+feature_cols = [
     "Total_Spending",
     "Purchase_Frequency",
     "Total_Quantity",
     "Average_Order_Value",
-    "Recency_Days"
+    "Days_Since_Last_Purchase",
+    "Customer_Tenure_Days"
 ]
 
-X = dataset[FEATURES].replace([np.inf, -np.inf], np.nan)
-y = dataset["Future_Spending"].clip(lower=0)
+X = data[feature_cols].replace([np.inf, -np.inf], np.nan)
+y = data["FutureSpending"].clip(lower=0)
 
-# -----------------------------------
-# 4. Customer segmentation
-# -----------------------------------
+# Chronological split already separates the future target.
+# Hold out customers for evaluation.
+if len(data) < 10:
+    raise ValueError("Too few customers to train and evaluate the model.")
 
-print("Creating customer segments...")
+rng = np.random.RandomState(42)
+indices = rng.permutation(len(data))
+split_at = max(1, int(len(data) * 0.8))
+train_idx = indices[:split_at]
+test_idx = indices[split_at:]
 
-segment_data = np.log1p(
-    features[["Total_Spending", "Purchase_Frequency", "Total_Quantity"]]
-    .clip(lower=0)
-)
+if len(test_idx) == 0:
+    raise ValueError("Not enough customers for a test set.")
 
-scaler = StandardScaler()
-scaled_segments = scaler.fit_transform(segment_data)
+X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
 
-n_clusters = min(3, len(features))
-
-if n_clusters >= 2:
-    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-    cluster_ids = kmeans.fit_predict(scaled_segments)
-
-    features["Cluster_ID"] = cluster_ids
-
-    cluster_order = (
-        features.groupby("Cluster_ID")["Total_Spending"]
-        .mean()
-        .sort_values()
-        .index.tolist()
-    )
-
-    if len(cluster_order) == 3:
-        labels = {
-            cluster_order[0]: "Low Value",
-            cluster_order[1]: "Regular",
-            cluster_order[2]: "High Value"
-        }
-    else:
-        labels = {
-            cluster_id: f"Segment {i + 1}"
-            for i, cluster_id in enumerate(cluster_order)
-        }
-
-    features["Customer_Segment"] = features["Cluster_ID"].map(labels)
-else:
-    features["Cluster_ID"] = 0
-    features["Customer_Segment"] = "All Customers"
-
-# -----------------------------------
-# 5. Build the Random Forest model
-# -----------------------------------
-
-print("Training Random Forest model...")
-
-model_pipeline = Pipeline([
-    ("imputer", SimpleImputer(strategy="median")),
-    ("model", RandomForestRegressor(
-        n_estimators=300,
-        min_samples_leaf=2,
-        random_state=42,
-        n_jobs=-1
-    ))
-])
-
-# The target is log-transformed during training and automatically
-# converted back to spending units during prediction.
+# --------------------------------------------------
+# 7. TRAIN A SMALLER RANDOM FOREST
+# --------------------------------------------------
 model = TransformedTargetRegressor(
-    regressor=model_pipeline,
+    regressor=Pipeline([
+        ("imputer", SimpleImputer(strategy="median")),
+        ("rf", RandomForestRegressor(
+            n_estimators=100,
+            max_depth=12,
+            min_samples_leaf=3,
+            max_features=0.8,
+            random_state=42,
+            n_jobs=-1
+        ))
+    ]),
     func=np.log1p,
     inverse_func=np.expm1
 )
 
-# Holdout evaluation, when enough customers are available.
-if len(dataset) >= 10:
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42
-    )
+print("Training Random Forest...")
+model.fit(X_train, y_train)
 
-    model.fit(X_train, y_train)
-    predictions = np.clip(model.predict(X_test), 0, None)
+# --------------------------------------------------
+# 8. EVALUATE MODEL
+# --------------------------------------------------
+predictions = np.maximum(model.predict(X_test), 0)
 
-    mae = mean_absolute_error(y_test, predictions)
-    rmse = np.sqrt(mean_squared_error(y_test, predictions))
-    r2 = r2_score(y_test, predictions) if len(y_test) > 1 else np.nan
+mae = mean_absolute_error(y_test, predictions)
+rmse = np.sqrt(mean_squared_error(y_test, predictions))
+r2 = r2_score(y_test, predictions)
 
-    print("\nModel evaluation")
-    print(f"MAE:  {mae:.2f}")
-    print(f"RMSE: {rmse:.2f}")
-    print(f"R²:   {r2:.4f}")
-else:
-    print("Few customers available; skipping holdout evaluation.")
+print("\nMODEL PERFORMANCE")
+print("-----------------")
+print(f"MAE:  {mae:.2f}")
+print(f"RMSE: {rmse:.2f}")
+print(f"R²:   {r2:.3f}")
 
-# -----------------------------------
-# 6. Train final model on all customers
-# -----------------------------------
+pd.DataFrame({
+    "ActualSpending": y_test.to_numpy(),
+    "PredictedSpending": predictions
+}).to_csv("model_predictions.csv", index=False)
 
-print("Training final model on all customers...")
-model.fit(X, y)
+rf = model.regressor_.named_steps["rf"]
 
-# -----------------------------------
-# 7. Save predictions and results
-# -----------------------------------
-
-dataset["Predicted_Future_Spending"] = np.clip(
-    model.predict(X), 0, None
-)
-
-results = features.join(
-    dataset[["Future_Spending", "Predicted_Future_Spending"]]
-)
-
-results = results.reset_index()
-results.to_csv("customer_ml_results.csv", index=False)
-
-prediction_output = results[
-    ["CustomerID", "Future_Spending", "Predicted_Future_Spending"]
-]
-prediction_output.to_csv("model_predictions.csv", index=False)
-
-# Save feature importance from the fitted Random Forest.
-rf = model.regressor_.named_steps["model"]
-
-importance = pd.DataFrame({
-    "Feature": FEATURES,
+pd.DataFrame({
+    "Feature": feature_cols,
     "Importance": rf.feature_importances_
-}).sort_values("Importance", ascending=False)
+}).sort_values(
+    "Importance", ascending=False
+).to_csv("feature_importance.csv", index=False)
 
-importance.to_csv("feature_importance.csv", index=False)
+pd.DataFrame([{
+    "Model": "Random Forest",
+    "MAE": mae,
+    "RMSE": rmse,
+    "R2": r2
+}]).to_csv("model_comparison.csv", index=False)
 
-# -----------------------------------
-# 8. Save the trained model
-# -----------------------------------
+# --------------------------------------------------
+# 9. CUSTOMER SEGMENTATION
+# --------------------------------------------------
+cluster_cols = [
+    "Total_Spending",
+    "Purchase_Frequency",
+    "Average_Order_Value",
+    "Days_Since_Last_Purchase"
+]
 
-joblib.dump(
-    {
-        "model": model,
-        "features": FEATURES,
-        "history_cutoff": cutoff.strftime("%Y-%m-%d")
-    },
-    "best_model.joblib"
+cluster_data = data[cluster_cols].replace(
+    [np.inf, -np.inf], np.nan
 )
 
-# Verify the model file exists.
-if not os.path.exists("best_model.joblib"):
-    raise RuntimeError("Model file was not created.")
+imputer = SimpleImputer(strategy="median")
+cluster_array = imputer.fit_transform(cluster_data)
 
-print("\nTraining completed successfully!")
-print("Saved customer_ml_results.csv")
-print("Saved model_predictions.csv")
-print("Saved feature_importance.csv")
-print("Saved best_model.joblib")
-print("Model file size:", round(
-    os.path.getsize("best_model.joblib") / (1024 * 1024), 2
-), "MB")
+# Limit clusters when there are few customers
+n_clusters = min(4, len(data))
+
+kmeans = KMeans(
+    n_clusters=n_clusters,
+    random_state=42,
+    n_init=10
+)
+
+data["Cluster"] = kmeans.fit_predict(cluster_array)
+data.to_csv("customer_ml_results.csv", index=False)
+
+# --------------------------------------------------
+# 10. SAVE MODEL BUNDLE FOR STREAMLIT
+# --------------------------------------------------
+bundle = {
+    "model": model,
+    "features": feature_cols,
+    "history_cutoff": str(cutoff.date()),
+    "future_period_end": str(max_date.date()),
+    "cluster_model": kmeans,
+    "cluster_imputer": imputer,
+    "cluster_features": cluster_cols
+}
+
+joblib.dump(bundle, "best_model.joblib", compress=3)
+
+size_mb = os.path.getsize("best_model.joblib") / (1024 * 1024)
+
+print("\nFILES SAVED")
+print("-----------")
+print("customer_features.csv")
+print("customer_ml_results.csv")
+print("model_predictions.csv")
+print("feature_importance.csv")
+print("model_comparison.csv")
+print("best_model.joblib")
+print(f"Model size: {size_mb:.2f} MB")
+print(f"Total training time: {time.time() - start:.1f} seconds")
+
+if size_mb > 25:
+    print(
+        "NOTE: Model is still over GitHub's 25 MB browser-upload "
+        "limit. Keep the file and use another upload method."
+    )
+else:
+    print("Model is under 25 MB and may be uploaded via the browser.")
